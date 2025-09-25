@@ -189,8 +189,9 @@ def main():
                                            monitor=config.val_metric, mode='max')
     trainer = pl.Trainer(logger=False,
                          num_sanity_val_steps=0,
-                         gpus=0 if config.cpu else 1,
-                         progress_bar_refresh_rate=0 if config.silent else 1,
+                         accelerator="gpu",
+                         devices=1,
+                         gradient_clip_val=0.5,
                          max_epochs=config.epochs,
                          callbacks=[checkpoint_callback, earlystopping_callback])
 

@@ -2,7 +2,7 @@ import re
 
 import torch
 import numpy as np
-from torchmetrics import Metric, MetricCollection, F1, Precision, Recall
+from torchmetrics import Metric, MetricCollection, Precision, Recall
 from torchmetrics.functional.retrieval.ndcg import retrieval_normalized_dcg
 
 
@@ -33,8 +33,8 @@ def get_metrics(metric_threshold, monitor_metrics, num_classes):
     metrics = {
         'Micro-Precision': Precision(num_classes, metric_threshold, average='micro'),
         'Micro-Recall': Recall(num_classes, metric_threshold, average='micro'),
-        'Micro-F1': F1(num_classes, metric_threshold, average='micro'),
-        'Macro-F1': F1(num_classes, metric_threshold, average='macro'),
+        # 'Micro-F1': F1(num_classes, metric_threshold, average='micro'),
+        # 'Macro-F1': F1(num_classes, metric_threshold, average='macro'),
         # The f1 value of macro_precision and macro_recall. This variant of
         # macro_f1 is less preferred but is used in some works. Please
         # refer to Opitz et al. 2019 [https://arxiv.org/pdf/1911.03347.pdf]

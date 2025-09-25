@@ -67,7 +67,7 @@ class MultiLabelModel(pl.LightningModule):
             raise RuntimeError(
                 'Unsupported optimizer: {self.optimizer}')
 
-        torch.nn.utils.clip_grad_value_(parameters, 0.5)
+        # torch.nn.utils.clip_grad_value_(parameters, 0.5)
 
         return optimizer
 
@@ -86,7 +86,7 @@ class MultiLabelModel(pl.LightningModule):
     def validation_step_end(self, batch_parts):
         return self._shared_eval_step_end(batch_parts)
 
-    def validation_epoch_end(self, step_outputs):
+    def on_validation_epoch_end(self, step_outputs):
         return self._shared_eval_epoch_end(step_outputs, 'val')
 
     def test_step(self, batch, batch_idx):

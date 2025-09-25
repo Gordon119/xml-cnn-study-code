@@ -1,29 +1,38 @@
-import collections
+from collections import *
 import logging
 import os
+import re
 
 import torch
-import numpy as np
 import pandas as pd
 from nltk.tokenize import RegexpTokenizer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import Dataset
-from torchtext.vocab import Vocab
 from tqdm import tqdm
+from urllib.request import urlretrieve
+import zipfile
 
 from libmultilabel.utils import pad_sequence
 
-UNK = Vocab.UNK
-PAD = '**PAD**'
+UNK = "<unk>"
+PAD = "<pad>"
 
+GLOVE_WORD_EMBEDDING = {
+    "glove.42B.300d",
+    "glove.840B.300d",
+    "glove.6B.50d",
+    "glove.6B.100d",
+    "glove.6B.200d",
+    "glove.6B.300d",
+}
 
 class TextDataset(Dataset):
     """Class for text dataset"""
 
     def __init__(self, data, word_dict, classes, max_seq_length):
         self.data = data
-        self.word_dict = word_dict
+        self.word_dict = word_dict.word_dict
         self.classes = classes
         self.max_seq_length = max_seq_length
         self.num_classes = len(self.classes)
@@ -35,7 +44,7 @@ class TextDataset(Dataset):
     def __getitem__(self, index):
         data = self.data[index]
         return {
-            'text': torch.LongTensor([self.word_dict[word] for word in data['text']][:self.max_seq_length]),
+            'text': torch.LongTensor([self.word_dict.get(word, self.word_dict[UNK]) for word in data['text']][:self.max_seq_length]),
             'label': torch.IntTensor(self.label_binarizer.transform([data['label']])[0]),
         }
 
@@ -124,6 +133,38 @@ def load_datasets(
     logging.info(f'Finish loading dataset ({msg})')
     return datasets
 
+class AttributeDict(dict):
+    """AttributeDict is an extended dict that can access
+    stored items as attributes.
+
+    >>> ad = AttributeDict({'ans': 42})
+    >>> ad.ans
+    >>> 42
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_used", set())
+
+    def __getattr__(self, key: str) -> any:
+        try:
+            value = self[key]
+            self._used.add(key)
+            return value
+        except KeyError:
+            raise AttributeError(f'Missing attribute "{key}"')
+
+    def __setattr__(self, key: str, value: any) -> None:
+        self[key] = value
+        self._used.discard(key)
+
+    def used_items(self) -> dict:
+        """Return the items that have been used at least once after being set.
+
+        Returns:
+            dict: The used items.
+        """
+        return {k: self[k] for k in self._used}
 
 def load_or_build_text_dict(
     dataset,
@@ -132,53 +173,73 @@ def load_or_build_text_dict(
     embed_file=None,
     embed_cache_dir=None,
     silent=False,
-    normalize=False
 ):
     """Build or load the vocabulary from the training dataset or the predefined `vocab_file`.
     The pretrained embedding can be either from a self-defined `embed_file` or from one of
-    the vectors defined in torchtext `vectors` (https://pytorch.org/text/0.9.0/vocab.html#torchtext.vocab.Vocab.load_vectors).
+    the vectors: `glove.6B.50d`, `glove.6B.100d`, `glove.6B.200d`, `glove.6B.300d`, `glove.42B.300d`, or `glove.840B.300d`.
 
     Args:
         dataset (list): List of training instances with index, label, and tokenized text.
         vocab_file (str, optional): Path to a file holding vocabuaries. Defaults to None.
         min_vocab_freq (int, optional): The minimum frequency needed to include a token in the vocabulary. Defaults to 1.
-        embed_file (str): Path to a file holding pre-trained embeddings.
+        embed_file (str): Path to a file holding pre-trained embeddings or the name of the pretrained GloVe embedding. Defaults to None.
         embed_cache_dir (str, optional): Path to a directory for storing cached embeddings. Defaults to None.
         silent (bool, optional): Enable silent mode. Defaults to False.
-        normalize (bool, optional): Whether the word embeddings divide by `float(np.linalg.norm(vector) + 1e-6)`.
-        Defaults to False.
+        normalize_embed (bool, optional): Whether the embeddings of each word is normalized to a unit vector. Defaults to False.
 
     Returns:
-        torchtext.vocab.Vocab: A vocab object which maps tokens to indices.
+        tuple[dict, torch.Tensor]: A dictionary which maps tokens to indices and the pre-trained word vectors of shape (vocab_size, embed_dim).
     """
     if vocab_file:
-        logging.info(f'Load vocab from {vocab_file}')
-        with open(vocab_file, 'r') as fp:
-            vocab_list = [PAD] + [vocab.strip() for vocab in fp.readlines()]
-        vocabs = Vocab(collections.Counter(vocab_list), specials=[UNK],
-                       min_freq=1, specials_first=False)  # specials_first=False to keep PAD index 0
+        logging.info(f"Load vocab from {vocab_file}")
+        with open(vocab_file, "r") as fp:
+            vocab_list = [[vocab.strip() for vocab in fp.readlines()]]
+        # Keep PAD index 0 to align `padding_idx` of
+        # class Embedding in libmultilabel.nn.networks.modules.
+        word_dict = _build_word_dict(vocab_list, min_vocab_freq=1, specials=[PAD, UNK])
     else:
-        counter = collections.Counter()
-        for data in dataset:
-            unique_tokens = set(data['text'])
-            counter.update(unique_tokens)
-        vocabs = Vocab(counter, specials=[PAD, UNK],
-                       min_freq=min_vocab_freq)
-    logging.info(f'Read {len(vocabs)} vocabularies.')
+        vocab_list = [set(data["text"]) for data in dataset]
+        word_dict = _build_word_dict(vocab_list, min_vocab_freq=min_vocab_freq, specials=[PAD, UNK])
 
-    if os.path.exists(embed_file):
-        logging.info(f'Load pretrained embedding from file: {embed_file}.')
-        embedding_weights = get_embedding_weights_from_file(vocabs, embed_file, silent, normalize)
-        vocabs.set_vectors(vocabs.stoi, embedding_weights,
-                           dim=embedding_weights.shape[1], unk_init=False)
-    elif not embed_file.isdigit():
-        logging.info(f'Load pretrained embedding from torchtext.')
-        vocabs.load_vectors(embed_file, cache=embed_cache_dir)
-    else:
-        raise NotImplementedError
+    logging.info(f"Read {len(word_dict)} vocabularies.")
 
-    return vocabs
+    embedding_weights = get_embedding_weights_from_file(word_dict, embed_file, silent, embed_cache_dir)
 
+    return AttributeDict({"word_dict": word_dict, "vectors":embedding_weights})
+
+
+def _build_word_dict(vocab_list, min_vocab_freq=1, specials=None):
+    r"""Build word dictionary, modified from `torchtext.vocab.build-vocab-from-iterator`
+    (https://docs.pytorch.org/text/stable/vocab.html#build-vocab-from-iterator)
+
+    Args:
+        vocab_list: List of words.
+        min_vocab_freq (int, optional): The minimum frequency needed to include a token in the vocabulary. Defaults to 1.
+        specials: Special tokens (e.g., <unk>, <pad>) to add. Defaults to None.
+
+    Returns:
+        dict: A dictionary which maps tokens to indices.
+    """
+
+    counter = Counter()
+    for tokens in vocab_list:
+        counter.update(tokens)
+
+    # sort by descending frequency, then lexicographically
+    sorted_by_freq_tuples = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+    ordered_dict = OrderedDict(sorted_by_freq_tuples)
+
+    # add special tokens at the beginning
+    tokens = specials or []
+    for token, freq in ordered_dict.items():
+        if freq >= min_vocab_freq:
+            tokens.append(token)
+
+    # build token to indices dict
+    word_dict = dict()
+    for idx, token in enumerate(tokens):
+        word_dict[token] = idx
+    return word_dict
 
 def load_or_build_label(datasets, label_file=None, silent=False):
     if label_file:
@@ -194,45 +255,83 @@ def load_or_build_label(datasets, label_file=None, silent=False):
     return classes
 
 
-def get_embedding_weights_from_file(word_dict, embed_file, silent=False, normalize=False):
-    """If there is an embedding file, load pretrained word embedding.
-    Otherwise, assign a zero vector to that word.
+def get_embedding_weights_from_file(word_dict, embed_file, silent=False, cache_dir=None):
+    """Obtain the word embeddings from file. If the word exists in the embedding file,
+    load the pretrained word embedding. Otherwise, assign a zero vector to that word.
+    If the given `embed_file` is the name of a pretrained GloVe embedding, the function
+    will first download the corresponding file.
 
     Args:
-        word_dict (torchtext.vocab.Vocab): A vocab object which maps tokens to indices.
-        embed_file (str): Path to a file holding pre-trained embeddings.
+        word_dict (dict): A dictionary for mapping tokens to indices.
+        embed_file (str): Path to a file holding pre-trained embeddings or the name of the pretrained GloVe embedding.
         silent (bool, optional): Enable silent mode. Defaults to False.
-        normalize (bool, optional): Whether the word embeddings divide by `float(np.linalg.norm(vector) + 1e-6)`.
-        Defaults to False. We follow the normalization method here:
-        https://github.com/jamesmullenbach/caml-mimic/blob/44a47455070d3d5c6ee69fb5305e32caec104960/dataproc/extract_wvs.py#L60.
+        cache_dir (str, optional): Path to a directory for storing cached embeddings. Defaults to None.
 
     Returns:
-        torch.Tensor: Embedding weights (vocab_size, embed_size)
+        torch.Tensor: Embedding weights (vocab_size, embed_size).
     """
+
+    if embed_file in GLOVE_WORD_EMBEDDING:
+        embed_file = _download_glove_embedding(embed_file, cache_dir=cache_dir)
+    elif not os.path.isfile(embed_file):
+        raise ValueError(
+            "Got embed_file {}, but allowed pretrained " "embeddings are {}".format(embed_file, GLOVE_WORD_EMBEDDING)
+        )
+
+    logging.info(f"Load pretrained embedding from {embed_file}.")
     with open(embed_file) as f:
         word_vectors = f.readlines()
+    embed_size = len(word_vectors[0].split()) - 1
 
-    embed_size = len(word_vectors[0].split())-1
-    embedding_weights = [np.zeros(embed_size) for i in range(len(word_dict))]
-
-    """ Add UNK embedding.
-    Attention xml: np.random.uniform(-1.0, 1.0, embed_size)
-    CAML: np.random.randn(embed_size)
-    """
-    unk_vector = np.random.randn(embed_size)
-    embedding_weights[word_dict[word_dict.UNK]] = unk_vector
-
-    # Load pretrained word embedding
-    vec_counts = 0
+    vector_dict = {}
     for word_vector in tqdm(word_vectors, disable=silent):
-        word, vector = word_vector.rstrip().split(' ', 1)
-        vector = np.array(vector.split()).astype(np.float)
-        embedding_weights[word_dict[word]] = vector
-        vec_counts += 1
+        word, vector = word_vector.rstrip().split(" ", 1)
+        vector = torch.Tensor(list(map(float, vector.split())))
+        vector_dict[word] = vector
 
-    logging.info(f'loaded {vec_counts}/{len(word_dict)} word embeddings')
-    if normalize:
-        for i, vector in enumerate(embedding_weights):
-            embedding_weights[i] = vector/float(np.linalg.norm(vector) + 1e-6)
+    embedding_weights = torch.zeros(len(word_dict), embed_size)
+    # Add UNK embedding
+    #   AttentionXML: np.random.uniform(-1.0, 1.0, embed_size)
+    #   CAML: np.random.randn(embed_size)
+    unk_vector = torch.randn(embed_size)
+    embedding_weights[word_dict[UNK]] = unk_vector
 
-    return torch.Tensor(embedding_weights)
+    # Store pretrained word embedding
+    vec_counts = 0
+    for word in word_dict.keys():
+        if word in vector_dict:
+            embedding_weights[word_dict[word]] = vector_dict[word]
+            vec_counts += 1
+
+    logging.info(f"Loaded {vec_counts}/{len(word_dict)} word embeddings")
+
+    return embedding_weights
+
+def _download_glove_embedding(embed_name, cache_dir=None):
+    """Download pretrained glove embedding from https://huggingface.co/stanfordnlp/glove/tree/main.
+
+    Args:
+        embed_name (str): The name of the pretrained GloVe embedding. Defaults to None.
+        cache_dir (str, optional): Path to a directory for storing cached embeddings. Defaults to None.
+
+    Returns:
+        str: Path to the file that contains the cached embeddings.
+    """
+    cache_dir = ".vector_cache" if cache_dir is None else cache_dir
+    cached_embed_file = f"{cache_dir}/{embed_name}.txt"
+    if os.path.isfile(cached_embed_file):
+        return cached_embed_file
+    os.makedirs(cache_dir, exist_ok=True)
+
+    remote_embed_file = re.sub(r"6B.*", "6B", embed_name) + ".zip"
+    url = f"https://huggingface.co/stanfordnlp/glove/resolve/main/{remote_embed_file}"
+    logging.info(f"Downloading pretrained embeddings from {url}.")
+    try:
+        zip_file, _ = urlretrieve(url, f"{cache_dir}/{remote_embed_file}")
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            zf.extractall(cache_dir)
+    except Exception as e:
+        os.remove(zip_file)
+        raise e
+    logging.info(f"Downloaded pretrained embeddings {embed_name} to {cached_embed_file}.")
+    return cached_embed_file
