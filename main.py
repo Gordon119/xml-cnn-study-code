@@ -186,7 +186,7 @@ def main():
                                           save_last=True, save_top_k=1,
                                           monitor=config.val_metric, mode='max')
     earlystopping_callback = EarlyStopping(patience=config.patience,
-                                           monitor=config.val_metric, mode='max')
+                                           monitor=config.val_metric, mode='max', strict=False)
     trainer = pl.Trainer(logger=False,
                          num_sanity_val_steps=0,
                          accelerator="gpu",
